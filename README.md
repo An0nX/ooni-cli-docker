@@ -1,121 +1,51 @@
-# OONI Probe CLI (Docker)
+# 🐳 OONI Probe Docker
 
-Docker-образ для запуска **OONI Probe CLI** (ooniprobe) в контейнере с удобным runner-скриптом для периодических измерений.
+[![Docker Image Size](https://img.shields.io/docker/image-size/whn0thacked/ooniprobe?style=flat-square&logo=docker&color=blue)](https://hub.docker.com/r/whn0thacked/ooniprobe)
+[![Docker Pulls](https://img.shields.io/docker/pulls/whn0thacked/ooniprobe?style=flat-square&logo=docker)](https://hub.docker.com/r/whn0thacked/ooniprobe)
+[![Architecture](https://img.shields.io/badge/arch-multi--arch-important?style=flat-square)](https://hub.docker.com/r/whn0thacked/ooniprobe/tags)
+[![OONI Powered](https://img.shields.io/badge/OONI-Powered-orange?style=flat-square)](https://ooni.org/)
 
-- Бинарник: `/usr/bin/ooniprobe`
-- Скрипт запуска: `/app/probe.sh`
-- Контейнер запускается **не от root** (пользователь `ooni`, UID/GID по умолчанию 1000/1000)
-- Данные и конфиг — в volume’ах `/config` и `/data`
+A high-quality, secure, and lightweight Docker image for the **OONI Probe CLI**. Designed to automatically run network measurements in the background.
 
-## Поддерживаемые архитектуры
+This image is engineered with a focus on security (**non-root**), correct time handling, and minimal resource consumption.
 
-Образ публикуется как multi-arch для:
-- `linux/amd64`
-- `linux/arm64`
-- `linux/arm/v7`
-- `linux/arm/v6`
-- `linux/386`
+---
 
-## Как это работает
+## ✨ Features
 
-Контейнер запускает `/app/probe.sh`, который:
-1. Проверяет обязательный `informed_consent=true`
-2. Генерирует конфиг `/config/config.json` на основе переменных окружения
-3. Выбирает режим:
-   - Если есть `/config/urls.txt` → запускает тест `websites` по этому списку
-   - Иначе → запускает `ooniprobe run unattended` (все тесты)
-4. Может работать:
-   - один раз (по умолчанию `sleep=false`)
-   - или постоянно с паузами между прогонами (`sleep=true`)
+- **🔐 Security:** Runs as non-root (UID/GID 1000), supports `read_only` filesystem.
+- **🏗 Multi-arch:** Supports `amd64`, `arm64`, `arm/v7`, `arm/v6`, `386`. Perfect for Raspberry Pi and VPS.
+- **🔄 Automation:** Built-in runner for periodic test execution.
+- **💾 Persistence:** Persists configuration and run history.
+- **🧠 Smart Execution:** Supports both full test suites (`unattended`) and specific site lists (`urls.txt`).
 
-## Быстрый старт (одиночный запуск)
+---
 
-```bash
-docker run --rm \
-  -e informed_consent=true \
-  -v "$(pwd)/config:/config" \
-  -v "$(pwd)/data:/data" \
-  -v /etc/localtime:/etc/localtime:ro \
-  whn0thacked/ooniprobe:latest
-```
+## ⚠️ Important Notice (Informed Consent)
 
-> Примечание: если `sleep=false` (по умолчанию), контейнер выполнит один прогон и завершится.
+Running OONI Probe can pose risks depending on your country and ISP.
+To run this container, you **must** explicitly confirm your consent to these risks via an environment variable.
 
-## Постоянный режим (каждые 6 часов)
+> **Learn more about potential risks:** [https://ooni.org/about/risks/](https://ooni.org/about/risks/)
+
+Activation variable: `informed_consent: "true"`
+
+---
+
+## 🚀 Quick Start (Docker Compose)
+
+We strongly recommend using **Docker Compose** for easy management and security configuration.
+
+### 1. Prepare Directories
+Since the container runs as user `1000`, create the folders beforehand and set ownership to avoid permission errors (especially on Linux):
 
 ```bash
-docker run -d \
-  --name ooniprobe \
-  -e informed_consent=true \
-  -e sleep=true \
-  -e seconds_between_tests=21600 \
-  -v "$(pwd)/config:/config" \
-  -v "$(pwd)/data:/data" \
-  -v /etc/localtime:/etc/localtime:ro \
-  --restart unless-stopped \
-  whn0thacked/ooniprobe:latest
+mkdir -p config data
+sudo chown -R 1000:1000 config data
 ```
 
-## Режим websites (своий список URL)
-
-Создайте файл `./config/urls.txt`, по одному URL на строку, например:
-```txt
-https://example.com
-https://ooni.org
-https://github.com
-```
-
-Запуск:
-```bash
-docker run --rm \
-  -e informed_consent=true \
-  -e sleep=false \
-  -v "$(pwd)/config:/config" \
-  -v "$(pwd)/data:/data" \
-  whn0thacked/ooniprobe:latest
-```
-
-Если `urls.txt` существует — будет использован тест `run websites --input-file=/config/urls.txt`.
-
-## Переменные окружения
-
-| Переменная | Обяз. | По умолчанию | Описание |
-|---|---:|---|---|
-| `informed_consent` | да | (нет) | Должно быть `true`, иначе контейнер завершится с ошибкой |
-| `upload_results` | нет | `false` | Отправлять результаты в OONI |
-| `sleep` | нет | `false` | `true` = контейнер работает постоянно; `false` = один прогон |
-| `seconds_between_tests` | нет | `21600` | Интервал между прогонами в секундах (6 часов) |
-| `websites_max_runtime` | нет | `0` | Лимит времени для websites тестов |
-| `websites_enabled_category_codes` | нет | пусто | CSV категорий (будет конвертировано в JSON массив) |
-| `args` | нет | `unattended`* | Доп. аргументы для `ooniprobe run` (см. ниже) |
-
-\* Если `urls.txt` отсутствует, runner делает:
-- `ooniprobe run --config=/config/config.json ${args:-unattended}`
-
-## Тома (Volumes)
-
-- `/config` — конфигурация (скрипт пишет сюда `config.json`, и может читать `urls.txt`)
-- `/data` — состояние/артефакты runner’а (например `last_run`, `probe.pid`)
-
-Рекомендуется монтировать оба тома на host или использовать named volumes.
-
-## Время / Timezone
-
-В образе `TZ` специально не задан, чтобы можно было “тянуть” время с системы через `localtime`.
-
-Рекомендуемый вариант:
-```bash
--v /etc/localtime:/etc/localtime:ro
-```
-
-(Опционально, если у вас есть файл timezone):
-```bash
--v /etc/timezone:/etc/timezone:ro
-```
-
-## “Идеальный” docker-compose.yml
-
-Ниже пример для постоянной работы, с безопасными настройками и корректным временем хоста:
+### 2. Configuration File
+Create a `docker-compose.yml` file:
 
 ```yaml
 services:
@@ -124,59 +54,96 @@ services:
     container_name: ooniprobe
     restart: unless-stopped
 
-    # Runner settings
     environment:
+      # MANDATORY: Consent confirmation
       informed_consent: "true"
-      upload_results: "false"
-      sleep: "true"
-      seconds_between_tests: "21600"
-      # args: "unattended"   # можно не задавать, это дефолт для режима без urls.txt
+      
+      # Operational settings
+      upload_results: "true"           # Upload reports to OONI
+      sleep: "true"                    # Infinite loop (daemon mode)
+      seconds_between_tests: "21600"   # Interval (sec) = 6 hours
 
-    # Persist config + state
     volumes:
+      # Data and configs
       - ./config:/config
       - ./data:/data
-
-      # Take timezone from host
+      # Time sync with host (critical for correct logs)
       - /etc/localtime:/etc/localtime:ro
-      # - /etc/timezone:/etc/timezone:ro
+      - /etc/timezone:/etc/timezone:ro
 
-    # Security hardening (обычно работает без проблем)
+    # Hardening (Security improvements)
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
 
-    # (опционально) ограничение ресурсов
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "1.0"
-    #       memory: 512M
+    # Resource limits (optional but recommended)
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 256M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 ```
 
-Запуск:
+### 3. Start
 ```bash
 docker compose up -d
-docker compose logs -f
 ```
+View logs: `docker compose logs -f`
 
-## Сборка и публикация multi-arch (для maintainer’а)
+---
 
-Нужно использовать buildx builder с driver `docker-container`:
+## ⚙️ Configuration
 
-```bash
-docker run --privileged --rm tonistiigi/binfmt --install all
+### Environment Variables
 
-docker buildx create --name multiarch --driver docker-container --use
-docker buildx inspect --bootstrap
+| Variable | Mandatory | Default | Description |
+|---|:---:|---|---|
+| `informed_consent` | **Yes** | — | Set to `true` to consent to risks. Container will not start without this. |
+| `upload_results` | No | `false` | Upload measurement results to OONI servers. |
+| `sleep` | No | `false` | `true` = Daemon mode (repeat every N sec). `false` = Single run and exit. |
+| `seconds_between_tests` | No | `21600` | Pause between test runs (in seconds). |
+| `websites_max_runtime` | No | `0` | Time limit for the websites test. |
+| `websites_enabled_category_codes` | No | — | CSV list of website category codes. |
+| `args` | No | `unattended` | Arguments for `ooniprobe` (if `urls.txt` is not used). |
 
-docker buildx build \
-  --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6,linux/386 \
-  -t whn0thacked/ooniprobe:latest \
-  --push .
-```
+### Volumes
 
-## Лицензия
+| Container Path | Purpose |
+|---|---|
+| **`/config`** | `config.json` is generated here. You can also place an optional `urls.txt` here. |
+| **`/data`** | Stores runner state, caches, and the OONI home directory. |
 
-OONI Probe CLI: см. upstream проект https://github.com/ooni/probe-cli
+---
+
+## 🧠 Runner Logic
+
+The `/app/probe.sh` script manages the container behavior:
+
+1.  **Config Generation:** Creates `/config/config.json` based on ENV variables.
+2.  **Mode Selection:**
+    *   If `/config/urls.txt` exists ➔ runs checks for specific sites:
+        `ooniprobe run websites --input-file=/config/urls.txt`
+    *   Else ➔ runs the full automatic test suite:
+        `ooniprobe run unattended`
+3.  **Loop:** If `sleep=true`, the process sleeps for the specified time and repeats step 2.
+
+---
+
+## 🔗 Useful Links
+
+- **CLI Source Code:** [github.com/ooni/probe-cli](https://github.com/ooni/probe-cli)
+- **OONI Documentation:** [ooni.org/support/ooni-probe-cli](https://ooni.org/support/ooni-probe-cli/)
