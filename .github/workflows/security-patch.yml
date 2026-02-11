@@ -152,7 +152,7 @@ jobs:
         continue-on-error: true
         with:
           image:      docker.io/${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
-          report:     copa-report.json
+          image-report:     copa-report.json
           patched-tag: ${{ needs.scan.outputs.version }}-copa
 
       - name: Push Copa (if patched)
