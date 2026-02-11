@@ -5,8 +5,8 @@
 # ==============================================================================
 FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
-# Добавляем jq для правильного парсинга JSON
-RUN apk add --no-cache git ca-certificates jq wget
+# Устанавливаем git, сертификаты, curl (для скачивания) и jq (для парсинга JSON)
+RUN apk add --no-cache git ca-certificates curl jq
 
 ARG TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT
 ARG OONI_VERSION=""
@@ -14,23 +14,33 @@ ARG OONI_VERSION=""
 WORKDIR /src
 
 RUN set -eux; \
+    # 1. Логика определения версии
     if [ -n "$OONI_VERSION" ]; then \
         LATEST_VERSION="$OONI_VERSION"; \
+        echo "Using specified version: $LATEST_VERSION"; \
     else \
-        LATEST_VERSION="$(wget -qO- 'https://api.github.com/repos/ooni/probe-cli/releases/latest' | jq -r .tag_name)"; \
+        # Скачиваем JSON и парсим поле tag_name через jq
+        # Добавляем User-Agent, чтобы GitHub не блокировал запрос
+        LATEST_VERSION="$(curl -sL -H "User-Agent: Docker-Build" \
+            'https://api.github.com/repos/ooni/probe-cli/releases/latest' \
+            | jq -r .tag_name)"; \
+        echo "Detected latest version from API: $LATEST_VERSION"; \
     fi; \
     \
+    # 2. Проверка на ошибки (если версия пустая или null)
     if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then \
-        echo "Error: Failed to fetch latest version from GitHub API" >&2; \
+        echo "ERROR: Failed to fetch valid version tag from GitHub." >&2; \
         exit 1; \
     fi; \
     \
-    echo "Building version: $LATEST_VERSION"; \
+    # Убираем префикс 'v' для флага компиляции (v3.29.0 -> 3.29.0)
     VER_NUM="$(echo "${LATEST_VERSION}" | sed 's/^v//')"; \
     \
+    # 3. Клонирование
     git clone --depth 1 --branch "${LATEST_VERSION}" \
         https://github.com/ooni/probe-cli.git .; \
     \
+    # 4. Настройка окружения Go
     export GOOS="${TARGETOS}" GOARCH="${TARGETARCH}"; \
     case "${TARGETVARIANT}" in \
         v7) export GOARM=7 ;; \
@@ -38,16 +48,13 @@ RUN set -eux; \
         v5) export GOARM=5 ;; \
     esac; \
     \
+    # 5. Сборка
     CGO_ENABLED=0 go build \
         -ldflags "-s -w -X github.com/ooni/probe-cli/v3/internal/version.Version=${VER_NUM}" \
         -trimpath \
         -o /ooniprobe \
         ./cmd/ooniprobe; \
     \
-    if [ ! -f "/ooniprobe" ]; then \
-        echo "Error: Build failed, binary not found" >&2; \
-        exit 1; \
-    fi; \
     chmod +x /ooniprobe
 
 # ==============================================================================
