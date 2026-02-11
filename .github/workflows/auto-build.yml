@@ -2,7 +2,8 @@ name: Auto-update (check upstream) + multi-arch build & push
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    # Дважды в сутки: 06:00 и 18:00 UTC
+    - cron: "0 6,18 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -33,11 +34,6 @@ jobs:
       version: ${{ steps.get_version.outputs.version }}
       should_build: ${{ steps.decide.outputs.should_build }}
     steps:
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
       - name: Get upstream latest release tag (or input version)
         id: get_version
         env:
@@ -72,9 +68,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # публичный endpoint Docker Hub для проверки тега
           url="https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}/"
-          code="$(curl -fsSL -o /dev/null -w "%{http_code}" "$url" || true)"
+          code="$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)"
 
           if [ "$code" = "200" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"

@@ -10,21 +10,25 @@ RUN apk add --no-cache \
         jq \
         ca-certificates
 
+# Используем TARGETPLATFORM от Docker Buildx вместо uname -m,
+# т.к. uname под QEMU может врать
+ARG TARGETPLATFORM
+
 WORKDIR /build
 
 RUN set -eux; \
-    case "$(uname -m)" in \
-        x86_64)                     ARCH="amd64"  ;; \
-        aarch64|arm64)              ARCH="arm64"  ;; \
-        armv7l|armv7)               ARCH="armv7"  ;; \
-        armv6l|armv6)               ARCH="armv6"  ;; \
-        i686|i386|x86)              ARCH="386"    ;; \
-        *)  echo ">>> Unsupported architecture: $(uname -m)" >&2; \
-            echo ">>> Supported: x86_64, aarch64, armv7l, armv6l, i686" >&2; \
+    # --- маппинг TARGETPLATFORM -> суффикс ассета upstream ---
+    case "${TARGETPLATFORM}" in \
+        linux/amd64)    ASSET_SUFFIX="linux-amd64"  ;; \
+        linux/arm64)    ASSET_SUFFIX="linux-arm64"  ;; \
+        linux/arm/v7)   ASSET_SUFFIX="linux-armv7"  ;; \
+        linux/arm/v6)   ASSET_SUFFIX="linux-armv6"  ;; \
+        linux/386)      ASSET_SUFFIX="linux-386"    ;; \
+        *)  echo ">>> Unsupported platform: ${TARGETPLATFORM}" >&2; \
             exit 1 ;; \
     esac; \
-    PLATFORM="linux-${ARCH}"; \
     \
+    # --- определяем последнюю версию ---
     LATEST_VERSION="$(curl -fsSL \
         -H 'Accept: application/vnd.github+json' \
         'https://api.github.com/repos/ooni/probe-cli/releases/latest' \
@@ -35,22 +39,46 @@ RUN set -eux; \
         exit 1; \
     fi; \
     \
-    DOWNLOAD_URL="https://github.com/ooni/probe-cli/releases/download/${LATEST_VERSION}/ooniprobe-${PLATFORM}"; \
-    echo ">>> Architecture: $(uname -m) -> ${PLATFORM}"; \
-    echo ">>> Version: ${LATEST_VERSION}"; \
-    echo ">>> URL: ${DOWNLOAD_URL}"; \
+    # --- ищем нужный ассет через API (а не угадываем URL) ---
+    ASSETS_JSON="$(curl -fsSL \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/ooni/probe-cli/releases/tags/${LATEST_VERSION}")"; \
+    \
+    DOWNLOAD_URL="$(echo "$ASSETS_JSON" | jq -r \
+        --arg suffix "$ASSET_SUFFIX" \
+        '[.assets[] | select(.name | endswith($suffix))] | first | .browser_download_url // empty' \
+    )"; \
+    \
+    # Если точного совпадения нет — пробуем частичное
+    if [ -z "$DOWNLOAD_URL" ]; then \
+        DOWNLOAD_URL="$(echo "$ASSETS_JSON" | jq -r \
+            --arg suffix "$ASSET_SUFFIX" \
+            '[.assets[] | select(.name | contains("ooniprobe") and contains($suffix))] | first | .browser_download_url // empty' \
+        )"; \
+    fi; \
+    \
+    if [ -z "$DOWNLOAD_URL" ]; then \
+        echo ">>> ERROR: No asset found for '${ASSET_SUFFIX}' in release ${LATEST_VERSION}" >&2; \
+        echo ">>> Available assets:" >&2; \
+        echo "$ASSETS_JSON" | jq -r '.assets[].name' >&2; \
+        exit 1; \
+    fi; \
+    \
+    echo ">>> Platform:  ${TARGETPLATFORM} -> ${ASSET_SUFFIX}"; \
+    echo ">>> Version:   ${LATEST_VERSION}"; \
+    echo ">>> URL:       ${DOWNLOAD_URL}"; \
     \
     curl -fsSL -o ooniprobe "${DOWNLOAD_URL}"; \
-    FILE_SIZE=$(stat -f%z ooniprobe 2>/dev/null || stat -c%s ooniprobe 2>/dev/null); \
-    if [ "$FILE_SIZE" -lt 10000000 ]; then \
-        echo ">>> Downloaded file too small (${FILE_SIZE} bytes), probably an error" >&2; \
+    FILE_SIZE=$(stat -c%s ooniprobe); \
+    if [ "$FILE_SIZE" -lt 1000000 ]; then \
+        echo ">>> Downloaded file too small (${FILE_SIZE} bytes), probably an error page" >&2; \
         exit 1; \
     fi; \
     chmod +x ooniprobe; \
     \
     echo "${LATEST_VERSION}" > VERSION; \
-    echo "${PLATFORM}" > PLATFORM; \
-    echo ">>> Successfully downloaded: ooniprobe ${LATEST_VERSION} (${PLATFORM}, ${FILE_SIZE} bytes)"
+    echo "${ASSET_SUFFIX}" > PLATFORM; \
+    echo ">>> Successfully downloaded: ooniprobe ${LATEST_VERSION} (${ASSET_SUFFIX}, ${FILE_SIZE} bytes)"
 
 #===============================================================================
 # Stage 2: Runtime - образ + entrypoint для авто-фикса прав / HOME
@@ -112,7 +140,6 @@ RUN set -eux; \
 
 VOLUME ["/config", "/data"]
 
-# TZ специально не задаём (ожидаем /etc/localtime с хоста)
 ENV CONFIG_DIR=/config \
     DATA_DIR=/data \
     APP_DIR=/app \
