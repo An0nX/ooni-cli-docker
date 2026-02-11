@@ -148,7 +148,7 @@ jobs:
 
       - name: Copa patch
         id: copa
-        uses: project-copacetic/copa-action@v2
+        uses: project-copacetic/copa-action@main
         continue-on-error: true
         with:
           image:      docker.io/${{ env.IMAGE }}:${{ needs.check.outputs.version }}

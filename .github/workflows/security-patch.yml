@@ -148,7 +148,7 @@ jobs:
           vuln-type: os
 
       - name: Copa patch
-        uses: project-copacetic/copa-action@v2
+        uses: project-copacetic/copa-action@main
         continue-on-error: true
         with:
           image:      docker.io/${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
