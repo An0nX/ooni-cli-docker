@@ -1,88 +1,46 @@
 # syntax=docker/dockerfile:1
 
-#===============================================================================
-# Stage 1: Builder - загрузка бинарника с автоопределением версии и архитектуры
-#===============================================================================
-FROM alpine:latest AS builder
+# ==============================================================================
+# Stage 1: Builder — нативная кросс-компиляция Go для всех архитектур
+# ==============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
-RUN apk add --no-cache \
-        curl \
-        jq \
-        ca-certificates
+RUN apk add --no-cache git ca-certificates
 
-# Используем TARGETPLATFORM от Docker Buildx вместо uname -m,
-# т.к. uname под QEMU может врать
-ARG TARGETPLATFORM
+ARG TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT
+# Позволяет пиннить версию при необходимости: --build-arg OONI_VERSION=v3.24.0
+ARG OONI_VERSION=""
 
-WORKDIR /build
+WORKDIR /src
 
 RUN set -eux; \
-    # --- маппинг TARGETPLATFORM -> суффикс ассета upstream ---
-    case "${TARGETPLATFORM}" in \
-        linux/amd64)    ASSET_SUFFIX="linux-amd64"  ;; \
-        linux/arm64)    ASSET_SUFFIX="linux-arm64"  ;; \
-        linux/arm/v7)   ASSET_SUFFIX="linux-armv7"  ;; \
-        linux/arm/v6)   ASSET_SUFFIX="linux-armv6"  ;; \
-        linux/386)      ASSET_SUFFIX="linux-386"    ;; \
-        *)  echo ">>> Unsupported platform: ${TARGETPLATFORM}" >&2; \
-            exit 1 ;; \
+    if [ -n "$OONI_VERSION" ]; then \
+        LATEST_VERSION="$OONI_VERSION"; \
+    else \
+        LATEST_VERSION="$(wget -qO- \
+            'https://api.github.com/repos/ooni/probe-cli/releases/latest' \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"; \
+    fi; \
+    [ -n "$LATEST_VERSION" ] || { echo "Failed to fetch version" >&2; exit 1; }; \
+    VER_NUM="$(echo "${LATEST_VERSION}" | sed 's/^v//')"; \
+    git clone --depth 1 --branch "${LATEST_VERSION}" \
+        https://github.com/ooni/probe-cli.git .; \
+    export GOOS="${TARGETOS}" GOARCH="${TARGETARCH}"; \
+    case "${TARGETVARIANT}" in \
+        v7) export GOARM=7 ;; \
+        v6) export GOARM=6 ;; \
+        v5) export GOARM=5 ;; \
     esac; \
-    \
-    # --- определяем последнюю версию ---
-    LATEST_VERSION="$(curl -fsSL \
-        -H 'Accept: application/vnd.github+json' \
-        'https://api.github.com/repos/ooni/probe-cli/releases/latest' \
-        | jq -r '.tag_name')"; \
-    \
-    if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then \
-        echo ">>> Failed to fetch latest version from GitHub API" >&2; \
-        exit 1; \
-    fi; \
-    \
-    # --- ищем нужный ассет через API (а не угадываем URL) ---
-    ASSETS_JSON="$(curl -fsSL \
-        -H 'Accept: application/vnd.github+json' \
-        "https://api.github.com/repos/ooni/probe-cli/releases/tags/${LATEST_VERSION}")"; \
-    \
-    DOWNLOAD_URL="$(echo "$ASSETS_JSON" | jq -r \
-        --arg suffix "$ASSET_SUFFIX" \
-        '[.assets[] | select(.name | endswith($suffix))] | first | .browser_download_url // empty' \
-    )"; \
-    \
-    # Если точного совпадения нет — пробуем частичное
-    if [ -z "$DOWNLOAD_URL" ]; then \
-        DOWNLOAD_URL="$(echo "$ASSETS_JSON" | jq -r \
-            --arg suffix "$ASSET_SUFFIX" \
-            '[.assets[] | select(.name | contains("ooniprobe") and contains($suffix))] | first | .browser_download_url // empty' \
-        )"; \
-    fi; \
-    \
-    if [ -z "$DOWNLOAD_URL" ]; then \
-        echo ">>> ERROR: No asset found for '${ASSET_SUFFIX}' in release ${LATEST_VERSION}" >&2; \
-        echo ">>> Available assets:" >&2; \
-        echo "$ASSETS_JSON" | jq -r '.assets[].name' >&2; \
-        exit 1; \
-    fi; \
-    \
-    echo ">>> Platform:  ${TARGETPLATFORM} -> ${ASSET_SUFFIX}"; \
-    echo ">>> Version:   ${LATEST_VERSION}"; \
-    echo ">>> URL:       ${DOWNLOAD_URL}"; \
-    \
-    curl -fsSL -o ooniprobe "${DOWNLOAD_URL}"; \
-    FILE_SIZE=$(stat -c%s ooniprobe); \
-    if [ "$FILE_SIZE" -lt 1000000 ]; then \
-        echo ">>> Downloaded file too small (${FILE_SIZE} bytes), probably an error page" >&2; \
-        exit 1; \
-    fi; \
-    chmod +x ooniprobe; \
-    \
-    echo "${LATEST_VERSION}" > VERSION; \
-    echo "${ASSET_SUFFIX}" > PLATFORM; \
-    echo ">>> Successfully downloaded: ooniprobe ${LATEST_VERSION} (${ASSET_SUFFIX}, ${FILE_SIZE} bytes)"
+    CGO_ENABLED=0 go build \
+        -ldflags "-s -w -X github.com/ooni/probe-cli/v3/internal/version.Version=${VER_NUM}" \
+        -trimpath \
+        -o /ooniprobe \
+        ./cmd/ooniprobe; \
+    chmod +x /ooniprobe
 
-#===============================================================================
-# Stage 2: Runtime - образ + entrypoint для авто-фикса прав / HOME
-#===============================================================================
+# ==============================================================================
+# Stage 2: Runtime
+# ==============================================================================
 FROM alpine:latest
 
 LABEL org.opencontainers.image.title="OONI Probe" \
@@ -93,59 +51,30 @@ LABEL org.opencontainers.image.title="OONI Probe" \
       org.opencontainers.image.vendor="OONI" \
       org.opencontainers.image.licenses="BSD-3-Clause"
 
-ARG UID=1000
-ARG GID=1000
-ARG USERNAME=ooni
+ARG UID=1000 GID=1000 USERNAME=ooni
 
 RUN set -eux; \
-    apk add --no-cache \
-        ca-certificates \
-        tini \
-        tzdata \
-        su-exec; \
-    \
+    apk add --no-cache ca-certificates tini tzdata su-exec; \
     addgroup -g "${GID}" "${USERNAME}"; \
-    adduser \
-        -u "${UID}" \
-        -G "${USERNAME}" \
-        -h /data \
-        -s /sbin/nologin \
-        -D \
-        -H \
-        "${USERNAME}"; \
-    \
+    adduser -u "${UID}" -G "${USERNAME}" -h /data -s /sbin/nologin -D -H "${USERNAME}"; \
     mkdir -p /app /config /data; \
     chown -R "${USERNAME}:${USERNAME}" /app /config /data; \
     chmod 750 /app /config /data
 
 WORKDIR /app
 
-# Бинарник в /usr/bin
-COPY --from=builder /build/ooniprobe /usr/bin/ooniprobe
-COPY --from=builder /build/VERSION /build/PLATFORM /tmp/
-
-# Runner
+COPY --from=builder /ooniprobe /usr/bin/ooniprobe
 COPY --chown=${UID}:${GID} ./scripts/probe.sh /app/probe.sh
-
-# Entrypoint с автофиксами
 COPY ./scripts/docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN set -eux; \
-    chmod 0755 /usr/bin/ooniprobe; \
-    chmod 0755 /app/probe.sh; \
-    chmod 0755 /docker-entrypoint.sh; \
-    ln -sf /usr/bin/ooniprobe /app/ooniprobe; \
-    /usr/bin/ooniprobe -version || echo "Warning: version check failed"; \
-    rm -f /tmp/VERSION /tmp/PLATFORM || true
+    chmod 0755 /usr/bin/ooniprobe /app/probe.sh /docker-entrypoint.sh; \
+    ooniprobe -version || echo "Warning: cross-arch check skipped"
 
 VOLUME ["/config", "/data"]
 
-ENV CONFIG_DIR=/config \
-    DATA_DIR=/data \
-    APP_DIR=/app \
-    HOME=/data \
-    XDG_CACHE_HOME=/data/.cache \
-    XDG_CONFIG_HOME=/data/.config \
+ENV CONFIG_DIR=/config DATA_DIR=/data APP_DIR=/app HOME=/data \
+    XDG_CACHE_HOME=/data/.cache XDG_CONFIG_HOME=/data/.config \
     XDG_DATA_HOME=/data/.local/share
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \

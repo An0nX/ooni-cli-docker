@@ -1,0 +1,187 @@
+name: Security scan & patch
+
+on:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: security-patch
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  IMAGE: whn0thacked/ooniprobe
+  PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6,linux/386,linux/ppc64le,linux/s390x
+
+jobs:
+  # ── Scan ──
+  scan:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    outputs:
+      version:      ${{ steps.ver.outputs.version }}
+      fixable:      ${{ steps.count.outputs.fixable }}
+      needs_patch:  ${{ steps.decide.outputs.needs_patch }}
+      patch_tag:    ${{ steps.tag.outputs.patch_tag }}
+    steps:
+      - name: Get current version
+        id: ver
+        run: |
+          ver=$(curl -fsSL \
+            "https://hub.docker.com/v2/repositories/${IMAGE}/tags/?page_size=100" \
+            | jq -r '[.results[].name
+                      | select(test("^v[0-9]"))
+                      | select(test("patch|copa") | not)]
+                     | sort_by(.) | last // empty')
+          [ -z "$ver" ] && { echo "No version tags found" >&2; exit 1; }
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Current version: $ver"
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+          format: json
+          output: report.json
+          ignore-unfixed: true
+          vuln-type: os
+
+      - name: Count fixable CVEs
+        id: count
+        run: |
+          n=$(jq '[.Results[]?.Vulnerabilities[]?
+                   | select(.FixedVersion != null and .FixedVersion != "")]
+                  | length' report.json)
+          echo "fixable=$n" >> "$GITHUB_OUTPUT"
+          echo "Fixable vulnerabilities: $n"
+
+      - name: Patch tag
+        id: tag
+        run: |
+          echo "patch_tag=${{ steps.ver.outputs.version }}-patch.$(date -u +%Y%m%d)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Check existing tag
+        id: existing
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${IMAGE}/tags/${{ steps.tag.outputs.patch_tag }}/")
+          echo "exists=$([ "$code" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide
+        id: decide
+        run: |
+          if [ "${{ steps.count.outputs.fixable }}" -gt 0 ] && \
+             [ "${{ steps.existing.outputs.exists }}" = "false" ]; then
+            echo "needs_patch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_patch=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No patching needed (fixable=${{ steps.count.outputs.fixable }}, exists=${{ steps.existing.outputs.exists }})"
+          fi
+
+      # SARIF для GitHub Security tab (всегда)
+      - name: Trivy SARIF
+        uses: aquasecurity/trivy-action@0.28.0
+        if: always()
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+          format: sarif
+          output: trivy.sarif
+          vuln-type: os
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+
+  # ── Rebuild (multi-arch) ──
+  rebuild:
+    name: Security rebuild
+    needs: scan
+    if: needs.scan.outputs.needs_patch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with: { platforms: all }
+
+      - uses: docker/setup-buildx-action@v3
+        with: { driver: docker-container }
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Rebuild & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            OONI_VERSION=${{ needs.scan.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=security-patch
+          cache-to:   type=gha,scope=security-patch,mode=max
+
+      # Copa дополнительный патч (amd64, best-effort)
+      - name: Trivy for Copa
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
+          format: json
+          output: copa-report.json
+          ignore-unfixed: true
+          vuln-type: os
+
+      - name: Copa patch
+        uses: project-copacetic/copa-action@v2
+        continue-on-error: true
+        with:
+          image:      docker.io/${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
+          report:     copa-report.json
+          patched-tag: ${{ needs.scan.outputs.version }}-copa
+
+      - name: Push Copa (if patched)
+        continue-on-error: true
+        run: |
+          docker push "${{ env.IMAGE }}:${{ needs.scan.outputs.version }}-copa" 2>/dev/null && \
+            echo "✅ Copa: ${{ env.IMAGE }}:${{ needs.scan.outputs.version }}-copa" || \
+            echo "ℹ️ Copa: no additional patches"
+
+      # Верификация
+      - name: Verify patched image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
+          format: table
+          vuln-type: os
+          severity: CRITICAL,HIGH
+
+      - name: Verify SARIF
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ needs.scan.outputs.patch_tag }}
+          format: sarif
+          output: trivy-patched.sarif
+          vuln-type: os
+
+      - name: Upload patched SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-patched.sarif
+          category: security-patch

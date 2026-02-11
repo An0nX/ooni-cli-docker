@@ -1,159 +1,162 @@
-name: Auto-update (check upstream) + multi-arch build & push
+name: Build & Push
 
 on:
   schedule:
-    # Дважды в сутки: 06:00 и 18:00 UTC
     - cron: "0 6,18 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "Force build even if tag already exists on Docker Hub"
+        description: "Force build even if tag exists"
         type: boolean
         default: false
       version:
-        description: "Upstream version tag to build (e.g. v3.24.1). Empty = latest"
+        description: "Upstream version (e.g. v3.29.0), empty = latest"
         type: string
         required: false
 
 concurrency:
-  group: auto-build-ooniprobe
+  group: build-ooniprobe
   cancel-in-progress: true
 
 permissions:
   contents: read
+  security-events: write
 
 env:
-  IMAGE_NAME: whn0thacked/ooniprobe
-  UPSTREAM_REPO: ooni/probe-cli
+  IMAGE: whn0thacked/ooniprobe
+  UPSTREAM: ooni/probe-cli
+  PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6,linux/386,linux/ppc64le,linux/s390x
 
 jobs:
+  # ── Check ──
   check:
-    name: Check upstream version
+    name: Check upstream
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.get_version.outputs.version }}
+      version:      ${{ steps.ver.outputs.version }}
       should_build: ${{ steps.decide.outputs.should_build }}
     steps:
-      - name: Get upstream latest release tag (or input version)
-        id: get_version
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
+      - name: Resolve version
+        id: ver
         run: |
           set -euo pipefail
-
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            ver="${INPUT_VERSION}"
+          if [ -n "${{ inputs.version }}" ]; then
+            ver="${{ inputs.version }}"
           else
-            ver="$(
-              curl -fsSL \
-                -H "Accept: application/vnd.github+json" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
-              | jq -r '.tag_name'
-            )"
+            ver=$(curl -fsSL \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${UPSTREAM}/releases/latest" \
+              | jq -r '.tag_name')
           fi
-
-          if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-            echo "Failed to determine upstream version" >&2
-            exit 1
-          fi
-
+          [ -z "$ver" ] || [ "$ver" = "null" ] && { echo "No version" >&2; exit 1; }
           echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "Upstream version: $ver"
 
-      - name: Check if Docker Hub tag already exists
-        id: hub_tag
-        env:
-          VERSION: ${{ steps.get_version.outputs.version }}
+      - name: Check Docker Hub
+        id: hub
         run: |
-          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${IMAGE}/tags/${{ steps.ver.outputs.version }}/" || true)
+          echo "exists=$([ "$code" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-          url="https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}/"
-          code="$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)"
-
-          if [ "$code" = "200" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Docker Hub tag exists: ${IMAGE_NAME}:${VERSION}"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Docker Hub tag does NOT exist (HTTP $code): ${IMAGE_NAME}:${VERSION}"
-          fi
-
-      - name: Decide whether to build
+      - name: Decide
         id: decide
-        env:
-          FORCE: ${{ inputs.force }}
-          EXISTS: ${{ steps.hub_tag.outputs.exists }}
         run: |
-          set -euo pipefail
-
-          if [ "${FORCE:-false}" = "true" ]; then
+          if [ "${{ inputs.force }}" = "true" ] || [ "${{ steps.hub.outputs.exists }}" = "false" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Force enabled -> will build"
-            exit 0
-          fi
-
-          if [ "${EXISTS}" = "true" ]; then
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "Already built -> skip"
           else
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream version -> build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # ── Build ──
   build:
-    name: Build & Push multi-arch image
-    runs-on: ubuntu-latest
+    name: Build multi-arch
     needs: check
     if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+      security-events: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up QEMU (for cross-arch emulation)
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: all
+      - uses: docker/setup-qemu-action@v3
+        with: { platforms: all }
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker-container
+      - uses: docker/setup-buildx-action@v3
+        with: { driver: docker-container }
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Docker metadata (tags/labels)
+      - name: Metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest
             type=raw,value=${{ needs.check.outputs.version }}
+            type=raw,value=latest
           labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.check.outputs.version }}
 
-      - name: Build & push (multi-arch)
+      - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6,linux/386
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            OONI_VERSION=${{ needs.check.outputs.version }}
+          tags:   ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=build
+          cache-to:   type=gha,scope=build,mode=max
           sbom: true
           provenance: true
 
-      - name: Inspect pushed manifest
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.check.outputs.version }}"
+
+      # ── Trivy → GitHub Security ──
+      - name: Trivy scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ needs.check.outputs.version }}
+          format: sarif
+          output: trivy.sarif
+          vuln-type: os
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+
+      # ── Copa best-effort (amd64) ──
+      - name: Trivy scan (JSON for Copa)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: docker.io/${{ env.IMAGE }}:${{ needs.check.outputs.version }}
+          format: json
+          output: copa-report.json
+          ignore-unfixed: true
+          vuln-type: os
+
+      - name: Copa patch
+        id: copa
+        uses: project-copacetic/copa-action@v2
+        continue-on-error: true
+        with:
+          image:      docker.io/${{ env.IMAGE }}:${{ needs.check.outputs.version }}
+          report:     copa-report.json
+          patched-tag: ${{ needs.check.outputs.version }}-copa
+
+      - name: Push Copa image
+        if: steps.copa.outcome == 'success'
         run: |
-          set -euo pipefail
-          docker buildx imagetools inspect "${IMAGE_NAME}:${{ needs.check.outputs.version }}"
+          docker push "${{ env.IMAGE }}:${{ needs.check.outputs.version }}-copa"
+          echo "✅ Copa-patched: ${{ env.IMAGE }}:${{ needs.check.outputs.version }}-copa (amd64)"

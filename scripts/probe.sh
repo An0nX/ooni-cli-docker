@@ -25,7 +25,7 @@ set -eu
 #-------------------------------------------------------------------------------
 
 readonly SCRIPT_NAME="ooniprobe-runner"
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 
 # Directories (configurable via environment)
 readonly CONFIG_DIR="${CONFIG_DIR:-/config}"
@@ -195,7 +195,6 @@ setup_directories() {
 csv_to_json_array() {
     _input="${1:-}"
 
-    # Handle null/empty cases
     if [ -z "$_input" ] || [ "$_input" = "null" ]; then
         printf 'null'
         return
@@ -204,19 +203,18 @@ csv_to_json_array() {
     _result=""
     _old_ifs="$IFS"
     IFS=','
+    set -f  # защита от glob expansion
 
     for _item in $_input; do
-        # Trim whitespace using parameter expansion alternative
         _item=$(printf '%s' "$_item" | tr -d '[:space:]')
         [ -z "$_item" ] && continue
         _result="${_result}\"${_item}\","
     done
 
+    set +f
     IFS="$_old_ifs"
 
-    # Remove trailing comma
     _result="${_result%,}"
-
     printf '[%s]' "$_result"
 }
 
