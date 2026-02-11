@@ -1,12 +1,14 @@
 # syntax=docker/dockerfile:1
 
 # ==============================================================================
-# Stage 1: Builder — нативная кросс-компиляция Go для всех архитектур
+# Stage 1: Builder
+# Мы убрали '--platform=$BUILDPLATFORM', чтобы сборка шла в эмуляции (QEMU)
+# для целевой архитектуры. Это позволяет легко включить CGO.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
-# Устанавливаем git, сертификаты, curl (для скачивания) и jq (для парсинга JSON)
-RUN apk add --no-cache git ca-certificates curl jq
+# Добавляем curl (вместо wget) и build-base (GCC) для CGO
+RUN apk add --no-cache git ca-certificates curl jq build-base
 
 ARG TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT
 ARG OONI_VERSION=""
@@ -19,42 +21,44 @@ RUN set -eux; \
         LATEST_VERSION="$OONI_VERSION"; \
         echo "Using specified version: $LATEST_VERSION"; \
     else \
-        # Скачиваем JSON и парсим поле tag_name через jq
-        # Добавляем User-Agent, чтобы GitHub не блокировал запрос
-        LATEST_VERSION="$(curl -sL -H "User-Agent: Docker-Build" \
+        LATEST_VERSION="$(curl -fsSL -H "User-Agent: Docker-Build" \
             'https://api.github.com/repos/ooni/probe-cli/releases/latest' \
             | jq -r .tag_name)"; \
         echo "Detected latest version from API: $LATEST_VERSION"; \
     fi; \
     \
-    # 2. Проверка на ошибки (если версия пустая или null)
     if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then \
-        echo "ERROR: Failed to fetch valid version tag from GitHub." >&2; \
+        echo "Error: Failed to fetch valid version tag from GitHub." >&2; \
         exit 1; \
     fi; \
     \
-    # Убираем префикс 'v' для флага компиляции (v3.29.0 -> 3.29.0)
     VER_NUM="$(echo "${LATEST_VERSION}" | sed 's/^v//')"; \
     \
-    # 3. Клонирование
+    # 2. Клонирование
     git clone --depth 1 --branch "${LATEST_VERSION}" \
         https://github.com/ooni/probe-cli.git .; \
     \
-    # 4. Настройка окружения Go
-    export GOOS="${TARGETOS}" GOARCH="${TARGETARCH}"; \
+    # 3. Настройка GOARM для 32-битных ARM
+    # GOOS и GOARCH Go определит сам, так как мы внутри контейнера нужной архитектуры
     case "${TARGETVARIANT}" in \
         v7) export GOARM=7 ;; \
         v6) export GOARM=6 ;; \
         v5) export GOARM=5 ;; \
     esac; \
     \
-    # 5. Сборка
-    CGO_ENABLED=0 go build \
-        -ldflags "-s -w -X github.com/ooni/probe-cli/v3/internal/version.Version=${VER_NUM}" \
+    # 4. Сборка с CGO
+    # Используем -extldflags '-static' для создания полностью статического бинарника,
+    # чтобы он гарантированно работал в Runtime-образе.
+    CGO_ENABLED=1 go build \
+        -ldflags "-s -w -linkmode external -extldflags '-static' -X github.com/ooni/probe-cli/v3/internal/version.Version=${VER_NUM}" \
         -trimpath \
         -o /ooniprobe \
         ./cmd/ooniprobe; \
     \
+    if [ ! -f "/ooniprobe" ]; then \
+        echo "Error: Build failed, binary not found" >&2; \
+        exit 1; \
+    fi; \
     chmod +x /ooniprobe
 
 # ==============================================================================
