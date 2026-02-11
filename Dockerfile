@@ -5,10 +5,10 @@
 # ==============================================================================
 FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
-RUN apk add --no-cache git ca-certificates
+# Добавляем jq для правильного парсинга JSON
+RUN apk add --no-cache git ca-certificates jq wget
 
 ARG TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT
-# Позволяет пиннить версию при необходимости: --build-arg OONI_VERSION=v3.24.0
 ARG OONI_VERSION=""
 
 WORKDIR /src
@@ -17,25 +17,37 @@ RUN set -eux; \
     if [ -n "$OONI_VERSION" ]; then \
         LATEST_VERSION="$OONI_VERSION"; \
     else \
-        LATEST_VERSION="$(wget -qO- \
-            'https://api.github.com/repos/ooni/probe-cli/releases/latest' \
-            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"; \
+        LATEST_VERSION="$(wget -qO- 'https://api.github.com/repos/ooni/probe-cli/releases/latest' | jq -r .tag_name)"; \
     fi; \
-    [ -n "$LATEST_VERSION" ] || { echo "Failed to fetch version" >&2; exit 1; }; \
+    \
+    if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then \
+        echo "Error: Failed to fetch latest version from GitHub API" >&2; \
+        exit 1; \
+    fi; \
+    \
+    echo "Building version: $LATEST_VERSION"; \
     VER_NUM="$(echo "${LATEST_VERSION}" | sed 's/^v//')"; \
+    \
     git clone --depth 1 --branch "${LATEST_VERSION}" \
         https://github.com/ooni/probe-cli.git .; \
+    \
     export GOOS="${TARGETOS}" GOARCH="${TARGETARCH}"; \
     case "${TARGETVARIANT}" in \
         v7) export GOARM=7 ;; \
         v6) export GOARM=6 ;; \
         v5) export GOARM=5 ;; \
     esac; \
+    \
     CGO_ENABLED=0 go build \
         -ldflags "-s -w -X github.com/ooni/probe-cli/v3/internal/version.Version=${VER_NUM}" \
         -trimpath \
         -o /ooniprobe \
         ./cmd/ooniprobe; \
+    \
+    if [ ! -f "/ooniprobe" ]; then \
+        echo "Error: Build failed, binary not found" >&2; \
+        exit 1; \
+    fi; \
     chmod +x /ooniprobe
 
 # ==============================================================================
